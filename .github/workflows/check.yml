@@ -1,71 +1,96 @@
-name: VPN Gate Node Check
+/**
+ * VPN Gate SSTP 检测 Worker（自包含版，不依赖第三方限流接口）
+ * 部署：Cloudflare Workers → 编辑代码 → 全选替换 → 保存并部署
+ * 访问：https://你的worker/check?sstp=vpn:vpn@主机:端口
+ *
+ * 设计原则：
+ *   1. 节点“通不通”只看 TCP 连通性（SSTP 跑在 TCP 上，Workers 只能发 HTTP(S) 请求来探活）
+ *   2. IP 归属/ASN 情报改为“尽力而为”，查不到不计入失败，避免第三方接口 429 误杀全部节点
+ */
 
-on:
-  workflow_dispatch:
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+    if (url.pathname !== '/check') {
+      return new Response('ok', { status: 200 });
+    }
 
-concurrency:
-  group: gate-check
-  cancel-in-progress: false
+    const sstp = url.searchParams.get('sstp') || '';
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    // 从 sstp=vpn:vpn@host:port 解析出 host:port
+    const atIndex = sstp.lastIndexOf('@');
+    if (atIndex === -1) {
+      return Response.json({ success: false, error: 'invalid sstp param: missing @' }, { status: 400 });
+    }
+    const hostPort = sstp.slice(atIndex + 1);
+    const lastColon = hostPort.lastIndexOf(':');
+    if (lastColon === -1) {
+      return Response.json({ success: false, error: 'invalid sstp param: missing port' }, { status: 400 });
+    }
+    const host = hostPort.slice(0, lastColon);
+    const port = parseInt(hostPort.slice(lastColon + 1), 10);
+    if (!host || !port || port < 1 || port > 65535) {
+      return Response.json({ success: false, error: 'invalid host or port' }, { status: 400 });
+    }
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    const start = Date.now();
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+    // ---- 1) 连通性检测 ----
+    let connected = false;
+    let connErr = null;
+    try {
+      await fetch(`${port === 443 ? 'https' : 'http'}://${host}:${port}/`, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(8000),
+      });
+      connected = true;
+    } catch (e) {
+      connErr = e.message || String(e);
+      // TLS/HTTP 握手类报错通常说明端口是开的（只是不是标准 HTTP 服务），也视为可达
+      const isHandshakeErr = /TLS|SSL|certificate|self signed|handshake|alert|unable to get local issuer|4\d\d|5\d\d/i.test(connErr);
+      if (isHandshakeErr) connected = true;
+    }
+    const latency = Date.now() - start;
 
-      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
-        run: python vpngate.py
-        env:
-          # 已部署的检测 Worker (不要改动: 检测统一走这里)
-          CHECK_WORKER: ${{ secrets.DOMAIN }}
-          CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+    if (!connected) {
+      return Response.json({
+        success: false,
+        responseTime: latency,
+        colo: request.cf?.colo || null,
+        error: connErr || 'connection failed',
+      });
+    }
 
-      - name: Ensure GitHub Pages is enabled (one-time auto setup)
-        run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
-          echo "Pages API status: $code"
-          if [ "$code" = "404" ]; then
-            echo "首次运行: 启用 GitHub Pages (source = GitHub Actions, 目录 /public)"
-            curl -sS -X PUT \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
-            echo
-            sleep 10
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    // ---- 2) 出口 IP 情报（尽力而为，失败不计入节点可用性）----
+    let exit = null;
+    try {
+      const doh = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, {
+        headers: { accept: 'application/dns-json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      const dohJson = await doh.json();
+      const ip = dohJson?.Answer?.[0]?.data || null;
+      // 不调用第三方 ASN 查询，避免 429；交给 vpngate.py 按主机名分类住宅/机房
+      exit = {
+        ip,
+        country: null, country_code: null, city: null, continent: null,
+        asn: { asn: null, org: null, type: null },
+        is_datacenter: null,
+      };
+    } catch {
+      exit = {
+        ip: null, country: null, country_code: null, city: null, continent: null,
+        asn: { asn: null, org: null, type: null }, is_datacenter: null,
+      };
+    }
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: 'public'
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Show site URL
-        run: 'echo "site: https://仓库用户名.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+    return Response.json({
+      success: true,
+      responseTime: latency,
+      colo: request.cf?.colo || null,
+      exit,
+    });
+  },
+};
